@@ -116,6 +116,26 @@ public class ArkivNativeTests
         }
     }
 
+    [TestCase(0)]
+    [TestCase(19)]
+    [TestCase(21)]
+    public void An_address_of_another_length_is_refused_before_the_native_call(int length)
+    {
+        ulong handle = OpenChain(null, out _);
+        try
+        {
+            using (Assert.EnterMultipleScope())
+            {
+                Assert.That(() => ArkivNative.Account(handle, new byte[length]), Throws.ArgumentException);
+                Assert.That(() => ArkivNative.BuildApply(0, [], new byte[length]), Throws.ArgumentException);
+            }
+        }
+        finally
+        {
+            ArkivNative.Close(handle);
+        }
+    }
+
     [Test]
     public void A_store_lists_its_accounts_and_reads_them_back()
     {

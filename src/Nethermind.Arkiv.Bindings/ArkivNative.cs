@@ -42,6 +42,7 @@ public sealed class ArkivNativeException(ArkivStatus status, string message) : E
 public static unsafe partial class ArkivNative
 {
     private const string Library = "arkiv_ffi";
+    private const int AddressLength = 20;
     private static string? _libraryPath;
     private static int _resolverSet;
 
@@ -115,6 +116,11 @@ public static unsafe partial class ArkivNative
     [LibraryImport(Library)]
     private static partial int arkiv_store_accounts(byte* dir, nuint dirLen, out byte* outPtr, out nuint outLen);
 
+    private static void RequireAddress(ReadOnlySpan<byte> address, string name)
+    {
+        if (address.Length != AddressLength) throw new ArgumentException($"An address is {AddressLength} bytes, not {address.Length}.", name);
+    }
+
     /// <summary>Copies the returned buffer out, frees it, and throws for any status but <see cref="ArkivStatus.Ok"/>.</summary>
     private static byte[] Take(int status, byte* ptr, nuint len)
     {
@@ -175,8 +181,11 @@ public static unsafe partial class ArkivNative
 
     /// <summary>An account at the head.</summary>
     /// <returns><c>exists (1) ‖ balance (32, big-endian) ‖ nonce (8)</c>.</returns>
+    /// <exception cref="ArgumentException"><paramref name="address"/> is not 20 bytes.</exception>
     public static byte[] Account(ulong handle, ReadOnlySpan<byte> address)
     {
+        // The native side reads 20 bytes from the pointer, unchecked.
+        RequireAddress(address, nameof(address));
         fixed (byte* a = address)
         {
             int status = arkiv_account(handle, a, out byte* ptr, out nuint len);
@@ -245,8 +254,11 @@ public static unsafe partial class ArkivNative
     /// <summary>Applies one EIP-2718 transaction from <paramref name="sender"/> (20 bytes) to an open build.</summary>
     /// <returns>Its receipt: <c>success (1) ‖ cumulative gas (8) ‖ logs</c>.</returns>
     /// <exception cref="ArkivNativeException"><see cref="ArkivStatus.InvalidBlock"/> with the reason Arkiv's executor refused it; the build goes on without it.</exception>
+    /// <exception cref="ArgumentException"><paramref name="sender"/> is not 20 bytes.</exception>
     public static byte[] BuildApply(ulong session, ReadOnlySpan<byte> tx, ReadOnlySpan<byte> sender)
     {
+        // The native side reads 20 bytes from the pointer, unchecked.
+        RequireAddress(sender, nameof(sender));
         fixed (byte* t = tx)
         fixed (byte* s = sender)
         {

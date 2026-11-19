@@ -83,6 +83,8 @@ jobs:
       - name: Move artifacts
         run: |
           runtimes=src/Nethermind.Arkiv.Bindings/runtimes
+          # A platform that failed this time must not keep a binary from an older source.
+          rm -rf $runtimes/*/native
           for dir in artifacts/*/; do
             rid=$(basename "$dir")
             mkdir -p $runtimes/$rid/native

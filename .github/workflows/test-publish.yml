@@ -1,0 +1,111 @@
+name: Test / Publish
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish to NuGet
+        default: 'No'
+        type: choice
+        options:
+          - 'No'
+          - Staging
+          - Production
+
+jobs:
+  test:
+    name: Test
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, rid: linux-x64, file: libarkiv_ffi.so }
+          - { os: ubuntu-24.04-arm, rid: linux-arm64, file: libarkiv_ffi.so }
+          - { os: macos-latest, rid: osx-arm64, file: libarkiv_ffi.dylib }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          lfs: true
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v6
+
+      - name: Native tests
+        working-directory: native/arkiv-ffi
+        run: cargo test --release --locked
+
+      # The bindings are tested against the library built from this commit's source, not the committed binaries.
+      - name: Build the native library
+        working-directory: native/arkiv-ffi
+        run: |
+          cargo build --release --locked
+          mkdir -p ../../src/Nethermind.Arkiv.Bindings/runtimes/${{ matrix.rid }}/native
+          cp target/release/${{ matrix.file }} ../../src/Nethermind.Arkiv.Bindings/runtimes/${{ matrix.rid }}/native/
+
+      - name: Test
+        working-directory: src/Nethermind.Arkiv.Bindings.Tests
+        run: dotnet test -c release
+
+  publish:
+    name: Publish
+    needs: test
+    if: github.event_name == 'workflow_dispatch' && inputs.publish != 'No'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      NUGET_URL: ${{ inputs.publish == 'Staging' && 'https://int.nugettest.org' || 'https://www.nuget.org' }}
+      NUGET_SOURCE: ${{ inputs.publish == 'Staging' && 'https://apiint.nugettest.org' || 'https://api.nuget.org' }}/v3/index.json
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          lfs: true
+
+      # The committed binaries must have been built (by build-arkiv-ffi) from the source being published.
+      - name: Check the binaries
+        run: |
+          runtimes=src/Nethermind.Arkiv.Bindings/runtimes
+          for f in linux-x64/native/libarkiv_ffi.so linux-arm64/native/libarkiv_ffi.so osx-arm64/native/libarkiv_ffi.dylib; do
+            test -s $runtimes/$f || { echo "::error::$runtimes/$f is missing: run the build-arkiv-ffi workflow"; exit 1; }
+          done
+          built=$(cat $runtimes/SOURCE)
+          current=$(git rev-parse HEAD:native/arkiv-ffi)
+          [ "$built" = "$current" ] || { echo "::error::the binaries were built from native/arkiv-ffi $built, the source is now $current: run the build-arkiv-ffi workflow"; exit 1; }
+
+      - name: Detect version
+        id: version
+        working-directory: src
+        run: |
+          version_prefix=$(sed -n 's|.*<VersionPrefix>\(.*\)</VersionPrefix>.*|\1|p' Directory.Build.props)
+          version_suffix=$(sed -n 's|.*<VersionSuffix>\(.*\)</VersionSuffix>.*|\1|p' Directory.Build.props)
+          version=$version_prefix${version_suffix:+-$version_suffix}
+          echo "Detected version $version"
+          echo "version=$version" >> $GITHUB_OUTPUT
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v6
+
+      - name: NuGet login
+        uses: nuget/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
+        id: login
+        with:
+          user: ${{ secrets.NUGET_USER }}
+          audience: ${{ env.NUGET_URL }}
+          token-service-url: ${{ env.NUGET_URL }}/api/v2/token
+
+      - name: Publish
+        working-directory: src
+        run: |
+          dotnet pack ./Nethermind.Arkiv.Bindings -c release \
+            -p:Version=${{ steps.version.outputs.version }}.${{ github.run_number }}
+          dotnet nuget push ./artifacts/package/release/*.nupkg \
+            -k "${{ steps.login.outputs.NUGET_API_KEY }}" -s ${{ env.NUGET_SOURCE }}

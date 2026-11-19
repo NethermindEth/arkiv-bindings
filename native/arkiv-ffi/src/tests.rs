@@ -54,10 +54,9 @@ fn genesis_accounts_are_readable() {
 /// Rabdi blocks 1-700 with their senders, from `testdata/rabdi-vectors-1-700.jsonl.gz` (see `examples/vectors.rs`).
 fn rabdi_blocks() -> Vec<(Block, Vec<Address>)> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/rabdi-vectors-1-700.jsonl.gz");
-    let out = std::process::Command::new("gzip").args(["-dc", path]).output().expect("gzip");
-    String::from_utf8(out.stdout)
-        .unwrap()
-        .lines()
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(std::fs::File::open(path).unwrap()), &mut text).unwrap();
+    text.lines()
         .map(|line| {
             let vector: serde_json::Value = serde_json::from_str(line).unwrap();
             let bytes = alloy_primitives::hex::decode(vector["rlp"].as_str().unwrap()).unwrap();

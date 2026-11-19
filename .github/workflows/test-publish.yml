@@ -15,16 +15,26 @@ on:
           - Staging
           - Production
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   test:
-    name: Test
+    name: Test (${{ matrix.rid }})
     strategy:
+      fail-fast: false
       matrix:
         include:
           - { os: ubuntu-latest, rid: linux-x64, file: libarkiv_ffi.so }
           - { os: ubuntu-24.04-arm, rid: linux-arm64, file: libarkiv_ffi.so }
           - { os: macos-latest, rid: osx-arm64, file: libarkiv_ffi.dylib }
+          - { os: macos-26-intel, rid: osx-x64, file: libarkiv_ffi.dylib }
+          # Windows is experimental until it is known to build: its failure is reported, not blocking.
+          - { os: windows-latest, rid: win-x64, file: arkiv_ffi.dll, experimental: true }
+          - { os: windows-11-arm, rid: win-arm64, file: arkiv_ffi.dll, experimental: true }
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental || false }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -74,8 +84,12 @@ jobs:
       - name: Check the binaries
         run: |
           runtimes=src/Nethermind.Arkiv.Bindings/runtimes
-          for f in linux-x64/native/libarkiv_ffi.so linux-arm64/native/libarkiv_ffi.so osx-arm64/native/libarkiv_ffi.dylib; do
+          for f in linux-x64/native/libarkiv_ffi.so linux-arm64/native/libarkiv_ffi.so osx-arm64/native/libarkiv_ffi.dylib osx-x64/native/libarkiv_ffi.dylib; do
             test -s $runtimes/$f || { echo "::error::$runtimes/$f is missing: run the build-arkiv-ffi workflow"; exit 1; }
+          done
+          # Windows is packed when its build succeeded.
+          for f in win-x64/native/arkiv_ffi.dll win-arm64/native/arkiv_ffi.dll; do
+            test -s $runtimes/$f || echo "::warning::$runtimes/$f is missing: the package will not support that platform"
           done
           built=$(cat $runtimes/SOURCE)
           current=$(git rev-parse HEAD:native/arkiv-ffi)

@@ -1,7 +1,7 @@
 name: Set up Rust
 description: >-
   Makes rustup available (native/arkiv-ffi/rust-toolchain.toml then pins the toolchain on the first cargo call),
-  installs libclang for bindgen on Linux, and caches the cargo registry and the build by Cargo.lock.
+  makes libclang available to bindgen, and caches the cargo registry and the build by Cargo.lock.
 
 runs:
   using: composite
@@ -9,16 +9,30 @@ runs:
     - name: Install rustup
       shell: bash
       run: |
-        if ! command -v rustup >/dev/null; then
+        command -v rustup >/dev/null && exit 0
+        if [ "$RUNNER_OS" = Windows ]; then
+          arch=$([ "$RUNNER_ARCH" = ARM64 ] && echo aarch64 || echo x86_64)
+          curl --proto '=https' --tlsv1.2 -sSfLo rustup-init.exe "https://static.rust-lang.org/rustup/dist/$arch-pc-windows-msvc/rustup-init.exe"
+          ./rustup-init.exe -y --default-toolchain none
+          rm rustup-init.exe
+          echo "$USERPROFILE\\.cargo\\bin" >> "$GITHUB_PATH"
+        else
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         fi
 
     # bindgen (librocksdb-sys, mdbx-sys) needs libclang; macOS has it with Xcode.
     - name: Install libclang
-      if: runner.os == 'Linux'
       shell: bash
-      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev
+      run: |
+        case "$RUNNER_OS" in
+          Linux)
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev ;;
+          Windows)
+            llvm="C:\\Program Files\\LLVM\\bin"
+            [ -f "$llvm\\libclang.dll" ] || choco install llvm -y --no-progress
+            echo "LIBCLANG_PATH=$llvm" >> "$GITHUB_ENV" ;;
+        esac
 
     - name: Cache the Rust build
       uses: actions/cache@v5

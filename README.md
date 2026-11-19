@@ -17,7 +17,7 @@ P/Invoke layer and ships the built library for each platform.
 | `src/Nethermind.Arkiv.Bindings` | `ArkivNative`: the C ABI for .NET; the package, with `runtimes/<rid>/native/libarkiv_ffi.*` |
 | `src/Nethermind.Arkiv.Bindings.Tests` | Rabdi's genesis and blocks 1-700 executed through the bindings to their headers' state roots |
 
-Platforms: linux-x64, linux-arm64, osx-arm64.
+Platforms: linux-x64, linux-arm64, osx-arm64, osx-x64; win-x64 and win-arm64 are experimental (packed when they build).
 
 ## Build and test
 

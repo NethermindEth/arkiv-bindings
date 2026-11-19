@@ -1416,6 +1416,7 @@ dependencies = [
  "arkiv-rpc-types",
  "arkiv-tokenomics",
  "eyre",
+ "flate2",
  "golemdb-cells",
  "golemdb-merkle",
  "golemdb-storage",

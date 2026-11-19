@@ -45,6 +45,7 @@ golemdb-cells = { git = "https://github.com/Arkiv-Network/golemdb", tag = "v1.0.
 golemdb-merkle = { git = "https://github.com/Arkiv-Network/golemdb", tag = "v1.0.0" }
 
 [dev-dependencies]
+flate2 = "1.1"
 alloy-rpc-types-eth = "2.5"
 alloy-rpc-types-engine = { version = "2.5", features = ["serde"] }
 alloy-signer-local = "2.5"

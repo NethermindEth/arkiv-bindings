@@ -51,8 +51,8 @@ public class ArkivNativeTests
         return BinaryPrimitives.ReadUInt64LittleEndian(opened);
     }
 
-    private static byte[] Execute(ulong handle, Vector block, bool commit = true) =>
-        ArkivNative.ExecuteBlock(handle, block.Rlp, [.. block.Senders.SelectMany(s => s)], commit);
+    private static byte[] Execute(ulong handle, Vector block, ArkivApply apply = ArkivApply.Commit) =>
+        ArkivNative.ExecuteBlock(handle, block.Rlp, [.. block.Senders.SelectMany(s => s)], apply);
 
     [Test]
     public void Opens_at_rabdis_genesis()
@@ -97,13 +97,42 @@ public class ArkivNativeTests
     }
 
     [Test]
+    public void A_held_block_commits_when_adopted()
+    {
+        ulong handle = OpenChain(null, out _);
+        ulong reference = OpenChain(null, out _);
+        try
+        {
+            Vector first = Vectors.Value[0];
+            byte[] committed = Execute(reference, first);
+            byte[] hash = ArkivNative.Head(reference).AsSpan(8, 32).ToArray();
+
+            byte[] held = Execute(handle, first, ArkivApply.Hold);
+            Assert.That(Convert.ToHexStringLower(ArkivNative.Head(handle).AsSpan(8, 32)), Is.EqualTo(GenesisHash), "nothing commits while held");
+            ArkivNative.Adopt(handle, hash);
+            using (Assert.EnterMultipleScope())
+            {
+                Assert.That(held, Is.EqualTo(committed), "a held block reports what a committed one does");
+                Assert.That(ArkivNative.Head(handle), Is.EqualTo(ArkivNative.Head(reference)));
+                Assert.That(Assert.Throws<ArkivNativeException>(() => ArkivNative.Adopt(handle, hash))!.Status, Is.EqualTo(ArkivStatus.NotOnHead), "adopted already");
+                Assert.That(() => ArkivNative.Adopt(handle, new byte[31]), Throws.ArgumentException);
+            }
+        }
+        finally
+        {
+            ArkivNative.Close(handle);
+            ArkivNative.Close(reference);
+        }
+    }
+
+    [Test]
     public void Errors_carry_their_status()
     {
         ulong handle = OpenChain(null, out _);
         try
         {
             ArkivNativeException offHead = Assert.Throws<ArkivNativeException>(() => Execute(handle, Vectors.Value[1]))!;
-            ArkivNativeException garbage = Assert.Throws<ArkivNativeException>(() => ArkivNative.ExecuteBlock(handle, [1, 2, 3], [], commit: true))!;
+            ArkivNativeException garbage = Assert.Throws<ArkivNativeException>(() => ArkivNative.ExecuteBlock(handle, [1, 2, 3], [], ArkivApply.Commit))!;
             using (Assert.EnterMultipleScope())
             {
                 Assert.That(offHead.Status, Is.EqualTo(ArkivStatus.NotOnHead));

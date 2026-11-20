@@ -14,8 +14,7 @@ on:
         type: boolean
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 defaults:
   run:
@@ -69,6 +68,9 @@ jobs:
     needs: build
     if: github.event.inputs.create-pr == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - name: Check out repository
         uses: actions/checkout@v7

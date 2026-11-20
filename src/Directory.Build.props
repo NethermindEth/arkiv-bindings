@@ -13,7 +13,10 @@
   <PropertyGroup Label="ProductInfo">
     <Authors>Nethermind</Authors>
     <Copyright>Demerzel Solutions Limited</Copyright>
-    <!-- The Arkiv release the native library is built from (native/arkiv-ffi/Cargo.toml pins its crates). -->
+    <!--
+      The package version, published as it is to Staging and then Production: bump it (or set a VersionSuffix such as
+      rc.1) for every release. native/arkiv-ffi/Cargo.toml pins the Arkiv release the library is built from.
+    -->
     <VersionPrefix>1.0.0</VersionPrefix>
     <VersionSuffix></VersionSuffix>
   </PropertyGroup>

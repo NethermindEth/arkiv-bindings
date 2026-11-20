@@ -52,15 +52,25 @@ jobs:
       - name: Set up .NET
         uses: actions/setup-dotnet@v6
 
+      # On failure cargo's errors become an annotation, which anyone can read; job logs need admin rights.
       - name: Native tests
         working-directory: native/arkiv-ffi
-        run: cargo test --release --locked
+        run: |
+          set -o pipefail
+          cargo test --release --locked 2>&1 | tee ../cargo-test.log || {
+            echo "::error title=cargo test (${{ matrix.rid }})::$(grep -E -A4 '^error|panicked|FAILED' ../cargo-test.log | head -60 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+            exit 1
+          }
 
       # The bindings are tested against the library built from this commit's source, not the committed binaries.
       - name: Build the native library
         working-directory: native/arkiv-ffi
         run: |
-          cargo build --release --locked
+          set -o pipefail
+          cargo build --release --locked 2>&1 | tee ../cargo-build.log || {
+            echo "::error title=cargo build (${{ matrix.rid }})::$(grep -E '^error' -A6 ../cargo-build.log | head -40 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+            exit 1
+          }
           mkdir -p ../../src/Nethermind.Arkiv.Bindings/runtimes/${{ matrix.rid }}/native
           cp target/release/${{ matrix.file }} ../../src/Nethermind.Arkiv.Bindings/runtimes/${{ matrix.rid }}/native/
 

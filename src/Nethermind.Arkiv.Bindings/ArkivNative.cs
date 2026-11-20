@@ -21,8 +21,21 @@ public enum ArkivStatus
     NotOnHead = 3,
     BadInput = 4,
     Internal = 5,
-    /// <summary>The block committed, but reading its result back failed: the head has moved to it, so it must not be treated as unapplied.</summary>
-    Committed = 6,
+}
+
+/// <summary>What <see cref="ArkivNative.ExecuteBlock"/> does with a block that executes to its header's root; mirrors <c>arkiv_ffi::Apply</c>.</summary>
+public enum ArkivApply
+{
+    /// <summary>Nothing: the store does not change.</summary>
+    DryRun = 0,
+    /// <summary>Commit it: the block becomes the store's head.</summary>
+    Commit = 1,
+    /// <summary>
+    /// Hold it, sealed and uncommitted, until <see cref="ArkivNative.Adopt"/> commits it. A sibling then executes over
+    /// the same head, and whichever block is adopted commits while the other leaves no trace: GolemDB has no rewind, so
+    /// a committed block could only be replaced by restoring the store from a copy.
+    /// </summary>
+    Hold = 2,
 }
 
 /// <summary>A native call that did not succeed, with the native side's message.</summary>
@@ -45,9 +58,10 @@ public sealed class ArkivNativeException(ArkivStatus status, string message) : E
 /// <see cref="Close"/>.
 /// </para>
 /// <para>
-/// A commit (<see cref="ExecuteBlock"/> with <c>commit</c> set) must not run concurrently with any other call on the
-/// same chain: it moves the head that reads and executions run against. Everything else may run concurrently, dry
-/// runs and builds of the same block included.
+/// A commit or a hold (<see cref="ExecuteBlock"/> with <see cref="ArkivApply.Commit"/> or <see cref="ArkivApply.Hold"/>)
+/// and <see cref="Adopt"/> must not run concurrently with any other call on the same chain: they move the head that
+/// reads and executions run against. Everything else may run concurrently, dry runs and builds of the same block
+/// included.
 /// </para>
 /// </remarks>
 public static unsafe partial class ArkivNative
@@ -101,7 +115,10 @@ public static unsafe partial class ArkivNative
     private static partial int arkiv_head(ulong handle, out byte* outPtr, out nuint outLen);
 
     [LibraryImport(Library)]
-    private static partial int arkiv_execute_block(ulong handle, byte* block, nuint blockLen, byte* senders, nuint sendersLen, int commit, out byte* outPtr, out nuint outLen);
+    private static partial int arkiv_execute_block(ulong handle, byte* block, nuint blockLen, byte* senders, nuint sendersLen, int apply, out byte* outPtr, out nuint outLen);
+
+    [LibraryImport(Library)]
+    private static partial int arkiv_adopt(ulong handle, byte* hash, out byte* outPtr, out nuint outLen);
 
     [LibraryImport(Library)]
     private static partial int arkiv_account(ulong handle, byte* address, out byte* outPtr, out nuint outLen);
@@ -178,29 +195,49 @@ public static unsafe partial class ArkivNative
 
     /// <summary>
     /// Executes a block (its RLP) on the store's head, given its transactions' senders (20 bytes each, in order), and when
-    /// <paramref name="commit"/> is set and the state root reached is the header's, commits it tagged with the block hash.
+    /// the state root reached is the header's, applies it as <paramref name="apply"/> says.
     /// </summary>
     /// <returns>
     /// The block's result: <c>state root (32) ‖ gas used (8) ‖ requests empty (1) ‖ receipts ‖ accounts written ‖
-    /// entities touched</c>, as <c>native/arkiv-ffi/src/wire.rs</c> lays it out.
+    /// entities touched</c>, as <c>native/arkiv-ffi/src/wire.rs</c> lays it out. The accounts and entities are read from
+    /// the block's own state, so a held block reports what it will commit.
     /// </returns>
     /// <exception cref="ArkivNativeException">
     /// <see cref="ArkivStatus.StateRootMismatch"/> (the message is the root reached), <see cref="ArkivStatus.InvalidBlock"/>,
-    /// <see cref="ArkivStatus.NotOnHead"/> when the block's parent is not the head, <see cref="ArkivStatus.Committed"/>
-    /// when the block committed but its result could not be read back.
+    /// <see cref="ArkivStatus.NotOnHead"/> when the block's parent is not the head. Nothing is applied on any of them.
     /// </exception>
     /// <remarks>
     /// A block Arkiv charges nothing for (no transaction) changes no state and commits nothing, as on arkiv-reth; it
     /// becomes the head the next block builds on, in memory. After the process restarts the head is the last block that
-    /// changed state, so the blocks applied since are applied again (each changes nothing).
+    /// changed state, so the blocks applied since are applied again (each changes nothing). Held blocks are in memory
+    /// too: after a restart they are executed again.
     /// </remarks>
-    public static byte[] ExecuteBlock(ulong handle, ReadOnlySpan<byte> blockRlp, ReadOnlySpan<byte> senders, bool commit)
+    public static byte[] ExecuteBlock(ulong handle, ReadOnlySpan<byte> blockRlp, ReadOnlySpan<byte> senders, ArkivApply apply)
     {
         fixed (byte* b = blockRlp)
         fixed (byte* s = senders)
         {
-            int status = arkiv_execute_block(handle, b, (nuint)blockRlp.Length, s, (nuint)senders.Length, commit ? 1 : 0, out byte* ptr, out nuint len);
+            int status = arkiv_execute_block(handle, b, (nuint)blockRlp.Length, s, (nuint)senders.Length, (int)apply, out byte* ptr, out nuint len);
             return Take(status, ptr, len);
+        }
+    }
+
+    /// <summary>
+    /// Commits the block <paramref name="blockHash"/> (32 bytes), held by <see cref="ExecuteBlock"/>: it becomes the
+    /// store's head, and every other block held at its height or below is dropped.
+    /// </summary>
+    /// <exception cref="ArkivNativeException">
+    /// <see cref="ArkivStatus.NotOnHead"/> when the block is not held over the store's head (never held, dropped by an
+    /// earlier adoption, or held before a restart): execute it again to apply it.
+    /// </exception>
+    /// <exception cref="ArgumentException"><paramref name="blockHash"/> is not 32 bytes.</exception>
+    public static void Adopt(ulong handle, ReadOnlySpan<byte> blockHash)
+    {
+        if (blockHash.Length != 32) throw new ArgumentException($"A block hash is 32 bytes, not {blockHash.Length}.", nameof(blockHash));
+        fixed (byte* h = blockHash)
+        {
+            int status = arkiv_adopt(handle, h, out byte* ptr, out nuint len);
+            Take(status, ptr, len);
         }
     }
 

@@ -13,7 +13,7 @@ P/Invoke layer and ships the built library for each platform.
 
 | | |
 | --- | --- |
-| `native/arkiv-ffi` | The native library: open a chain over a GolemDB store, execute and commit blocks, `eth_call` and `arkiv_*` RPC at the head, build blocks, list a store's accounts |
+| `native/arkiv-ffi` | The native library: open a chain over a GolemDB store, execute and commit blocks (or hold them uncommitted until adopted), `eth_call` and `arkiv_*` RPC at the head, build blocks, list a store's accounts |
 | `src/Nethermind.Arkiv.Bindings` | `ArkivNative`: the C ABI for .NET; the package, with `runtimes/<rid>/native/libarkiv_ffi.*` |
 | `src/Nethermind.Arkiv.Bindings.Tests` | Rabdi's genesis and blocks 1-700 executed through the bindings to their headers' state roots |
 
@@ -22,6 +22,12 @@ arkiv-reth appends to each commit (header, transactions, receipts, outside the s
 host keeps its own blocks. A store is therefore not a drop-in arkiv-reth datadir. Blocks with no transaction change no
 state and, as on arkiv-reth, commit nothing; the library keeps them as the head in memory, and after a restart the
 host applies them again from the last block that changed state.
+
+Reorgs at the tip: GolemDB has no rewind, so a committed block can only be replaced by restoring the store from a copy
+(arkiv-reth stalls instead: [arkiv#287](https://github.com/Arkiv-Network/arkiv/issues/287)). A host can execute a block
+with `ArkivApply.Hold` instead: it is sealed (its root and the accounts and entities it wrote are known) but not
+committed, and `ArkivNative.Adopt` commits it later, typically when its child arrives. A sibling at the same height
+executes over the same head meanwhile, and whichever is adopted commits while the other leaves no trace.
 
 Platforms: linux-x64, linux-arm64, osx-arm64, osx-x64; win-x64 and win-arm64 are experimental (packed when they build).
 

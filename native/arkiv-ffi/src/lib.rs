@@ -40,6 +40,7 @@ use reth_evm::ConfigureEvm;
 use reth_evm::execute::BlockExecutor;
 
 pub mod build;
+mod sealed;
 pub mod store;
 mod rpc;
 pub mod wire;
@@ -63,9 +64,30 @@ pub enum Status {
     BadInput = 4,
     /// A store or internal failure.
     Internal = 5,
-    /// The block committed, but reading its result back from the store failed. The store's head has moved to the
-    /// block, so executing it again is refused ([`Status::NotOnHead`]); the host must not treat the block as unapplied.
-    Committed = 6,
+}
+
+/// What [`Node::execute_block`] does with a block that executes to its header's root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Apply {
+    /// Nothing: the store does not change.
+    DryRun,
+    /// Commit it: the block becomes the store's head.
+    Commit,
+    /// Hold it, sealed and uncommitted, until [`Node::adopt`] commits it. A block held at the tip can lose to a
+    /// sibling at no cost: the sibling executes over the same head, and whichever block is adopted commits while the
+    /// other leaves no trace. Committing first would leave a reorg nothing to do but restore the store from a copy,
+    /// since GolemDB has no rewind.
+    Hold,
+}
+
+/// A block executed with [`Apply::Hold`] and not yet adopted.
+struct Held {
+    height: u64,
+    hash: B256,
+    parent: B256,
+    root: B256,
+    /// Whether its execution sealed a branch; one that changed nothing has none to commit.
+    sealed: bool,
 }
 
 /// One opened chain: its spec, its store and the executor configuration over them.
@@ -84,6 +106,8 @@ pub struct Node {
     /// are held here: the latest is the head the next block builds on. Cleared by the next commit; not persisted, so
     /// after a restart the host re-applies them from the store's head block, which costs nothing.
     unchanged_blocks: Mutex<Vec<B256>>,
+    /// Blocks executed over the head and held for [`Node::adopt`]; their sealed branches sit in `seals`.
+    held: Mutex<Vec<Held>>,
 }
 
 impl Node {
@@ -104,7 +128,7 @@ impl Node {
         let spec = Arc::new(Arc::unwrap_or_clone(file_spec.clone()).with_genesis_state_root(genesis_root));
         let genesis_hash = spec.genesis_hash();
 
-        let store: HostStore = match directory {
+        let opened: HostStore = match directory {
             // Archive history cannot come from GolemDB v1.0.0, which reads at its head only; the host keeps it.
             Some(directory) => Arc::new(
                 arkiv_golemdb::GolemDbStore::open(directory, &config, Some(arkiv_golemdb::PruningConfig::new(0)))
@@ -112,6 +136,8 @@ impl Node {
             ),
             None => Arc::new(arkiv_golemdb::GolemDbStore::open_memory(&config)?),
         };
+        // Seen through `SealWatch`, so a held block's sealed branch can be read before it commits.
+        let store: HostStore = Arc::new(sealed::SealWatch(opened));
         if store.head() == CommitId::GENESIS {
             seed_genesis(&store, genesis_hash.0, accounts()).map_err(|e| eyre::eyre!("seed genesis: {e:?}"))?;
         }
@@ -126,7 +152,7 @@ impl Node {
         let evm_config =
             EthEvmConfig::new_with_evm_factory(spec.clone(), ArkivEvmFactory::new(store.clone(), seals.clone(), OpCost::FromStore));
         let genesis_db = genesis_database(&spec);
-        Ok(Self { spec, store, seals, evm_config, genesis_db, genesis_hash, genesis_root, unchanged_blocks: Mutex::default() })
+        Ok(Self { spec, store, seals, evm_config, genesis_db, genesis_hash, genesis_root, unchanged_blocks: Mutex::default(), held: Mutex::default() })
     }
 
     /// The head: the store's head commit number, the latest block applied (the block that commit is tagged with,
@@ -139,16 +165,18 @@ impl Node {
         Ok((head.0, latest, B256::from(root)))
     }
 
-    /// Execute `block` on the store's head and, when `commit` is set and the root it reaches is the header's,
-    /// commit it tagged with the block hash.
+    /// Execute `block` on the store's head and, when the root it reaches is the header's, apply it as `apply` says.
     ///
     /// A block Arkiv charges nothing for (no transaction; Arkiv's own blocks always carry the protocol purge) leaves
     /// no sealed state. arkiv-reth then takes the header's root as it is and commits nothing; so does this, and the
     /// block becomes the head the next one builds on (see `unchanged_blocks`).
     ///
-    /// A commit must not run concurrently with any other call on the chain. Executions with `commit` unset seal into
-    /// a registry of their own, so several may run at once.
-    pub fn execute_block(&self, block: Block, senders: Vec<Address>, commit: bool) -> Result<wire::BlockResult, (Status, String)> {
+    /// The result reports the accounts and entities the block wrote as the block's own state holds them: its sealed
+    /// branch, which is what commits, so a held block reports the same as a committed one.
+    ///
+    /// A commit or an adoption must not run concurrently with any other call on the chain. A dry run seals into a
+    /// registry of its own, so several may run at once.
+    pub fn execute_block(&self, block: Block, senders: Vec<Address>, apply: Apply) -> Result<wire::BlockResult, (Status, String)> {
         let header = &block.header;
         let (_, head_tag, _) = self.head().map_err(internal)?;
         if head_tag != header.parent_hash {
@@ -166,14 +194,15 @@ impl Node {
         let recovered: Vec<Recovered<TransactionSigned>> =
             sealed.body().transactions.iter().zip(&senders).map(|(tx, sender)| Recovered::new_unchecked(tx.clone(), *sender)).collect();
 
-        // A dry run seals into a registry of its own: discarding it must not drop another execution's seal.
-        let (seals, evm_config) = if commit {
-            (self.seals.clone(), self.evm_config.clone())
-        } else {
+        // A dry run seals into a registry of its own: its branch goes with it, and no other execution's seal does.
+        let (seals, evm_config) = if apply == Apply::DryRun {
             let seals = Arc::new(BlockSeals::new());
             let config = EthEvmConfig::new_with_evm_factory(self.spec.clone(), ArkivEvmFactory::new(self.store.clone(), seals.clone(), OpCost::FromStore));
             (seals, config)
+        } else {
+            (self.seals.clone(), self.evm_config.clone())
         };
+        sealed::clear_last_sealed();
         let mut state = State::builder().with_database(self.genesis_db.clone()).with_bundle_update().build();
         let execution = {
             let mut executor = evm_config.executor_for_block(&mut state, &sealed).map_err(|e| (Status::InvalidBlock, format!("{e}")))?;
@@ -206,42 +235,25 @@ impl Node {
             accounts: Vec::new(),
             entities: Vec::new(),
         };
+        // A branch sealed to another root is never adopted: the next adoption at this height or above drops it.
         if root != expected_root {
-            if commit {
-                self.discard_pending(height);
-            }
             return Err((Status::StateRootMismatch, wire::encode_mismatch(root)));
         }
-        if !commit {
-            // The dry run's registry, and its sealed branch, go when it is dropped.
+        if apply == Apply::DryRun {
             return Ok(result);
         }
 
-        let commit = match sealed_root {
-            Some(_) => {
-                let committed = self
-                    .seals
-                    .adopt(&self.store, height, sealed.hash().0, root.0, &[])
-                    .map_err(|e| (Status::Internal, format!("commit block {height}: {e:?}")))?;
-                self.seals.finish_adoption(sealed.hash().0);
-                committed.ok_or_else(|| (Status::Internal, format!("no sealed candidate for block {height}")))?
-            }
-            None => {
-                self.unchanged_blocks.lock().expect("unchanged blocks poisoned").push(sealed.hash());
-                self.seals.finish_adoption(sealed.hash().0);
-                self.store.head()
-            }
+        // Where the block's state is read: its sealed branch, or the head it left unchanged.
+        let target = match sealed_root {
+            Some(root) => match sealed::last_sealed() {
+                Some((branch, branch_root)) if branch_root == root.0 => ReadTarget::Branch(branch),
+                _ => return Err((Status::Internal, format!("block {height} sealed, but not on this thread"))),
+            },
+            None => ReadTarget::Commit(self.store.head()),
         };
-        if sealed_root.is_some() {
-            self.unchanged_blocks.lock().expect("unchanged blocks poisoned").clear();
-        }
-        // From here the block is committed: a failure is reported as such, not as a block left unapplied.
-        let committed_failure = |e: String| (Status::Committed, format!("block {height} committed, but {e}"));
-
         // Every account the block wrote to: the executor mirrors each GolemDB balance and nonce write into reth's
-        // account diff, so the bundle names them. The values are read back from the committed store, which is the
-        // only authority on them.
-        let accounts = GolemAccounts::new(self.store.clone(), commit);
+        // account diff, so the bundle names them. The values are read from the block's state, which is the only
+        // authority on them.
         // Executed transactions sit in the state's transitions until merged; without this the bundle is empty
         // and no account would be reported (reth merges the same way after executing a block).
         state.merge_transitions(BundleRetention::PlainState);
@@ -249,29 +261,83 @@ impl Node {
         let mut touched: Vec<Address> = bundle.state.keys().copied().collect();
         touched.sort();
         for address in touched {
-            let account = accounts.account(address).map_err(|e| committed_failure(format!("reading account {address} failed: {e}")))?;
-            if let Some(account) = account {
-                result.accounts.push(wire::Account { address, balance: account.balance, nonce: account.nonce });
+            let account = self.read_account(target, address).map_err(|e| (Status::Internal, format!("reading account {address} failed: {e}")))?;
+            if let Some((balance, nonce)) = account {
+                result.accounts.push(wire::Account { address, balance, nonce });
             }
         }
         for entity_key in touched_entities(&sealed, &execution.receipts) {
-            let snapshot = arkiv_reth_rpc::store_reads::entity(&*self.store, commit, entity_key.0)
-                .map_err(|e| committed_failure(format!("reading entity {entity_key} failed: {e}")))?
+            let snapshot = arkiv_interfaces::entity_records::read::<_, arkiv_reth_rpc::store_reads::ReadError>(&*self.store, target, entity_key.0)
+                .map_err(|e| (Status::Internal, format!("reading entity {entity_key} failed: {e}")))?
                 .map(|entity| serde_json::to_vec(&entity_data_from(entity, &Projection::all())).expect("entity data serialises"));
             result.entities.push((entity_key, snapshot));
         }
+
+        self.held.lock().expect("held blocks poisoned").push(Held {
+            height,
+            hash: sealed.hash(),
+            parent: sealed.header().parent_hash,
+            root,
+            sealed: sealed_root.is_some(),
+        });
+        if apply == Apply::Commit {
+            self.adopt(sealed.hash())?;
+        }
         Ok(result)
+    }
+
+    /// Commit held block `hash`: it becomes the store's head, and every other block held at its height or below is
+    /// dropped. [`Status::NotOnHead`] when the block is not held over the current head (never executed with
+    /// [`Apply::Hold`], dropped by an earlier adoption, or held before a restart); the host then executes it again.
+    pub fn adopt(&self, hash: B256) -> Result<(), (Status, String)> {
+        let (_, head_tag, _) = self.head().map_err(internal)?;
+        let mut held = self.held.lock().expect("held blocks poisoned");
+        let Some(block) = held.iter().find(|b| b.hash == hash) else {
+            return Err((Status::NotOnHead, format!("block {hash} is not held")));
+        };
+        if block.parent != head_tag {
+            return Err((Status::NotOnHead, format!("block {hash} is held over {}, the store's head is {head_tag}", block.parent)));
+        }
+        let (height, root) = (block.height, block.root);
+        if block.sealed {
+            let committed = self
+                .seals
+                .adopt(&self.store, height, hash.0, root.0, &[])
+                .map_err(|e| (Status::Internal, format!("commit block {height}: {e:?}")))?;
+            self.seals.finish_adoption(hash.0);
+            if committed.is_none() {
+                held.retain(|b| b.height > height);
+                return Err((Status::NotOnHead, format!("block {hash}'s sealed state was dropped")));
+            }
+            self.unchanged_blocks.lock().expect("unchanged blocks poisoned").clear();
+        } else {
+            // Nothing to commit; still, the losers at this height go, as an adoption drops them. An adoption against a
+            // root no candidate has drops every candidate at or below `height` and commits nothing.
+            let _ = self.seals.adopt(&self.store, height, [0xff; 32], [0xff; 32], &[]);
+            self.seals.finish_adoption(hash.0);
+            self.unchanged_blocks.lock().expect("unchanged blocks poisoned").push(hash);
+        }
+        held.retain(|b| b.height > height);
+        Ok(())
+    }
+
+    /// An account in `target`'s state: its balance and nonce, or `None` when there is no such Ethereum account.
+    fn read_account(&self, target: ReadTarget, address: Address) -> eyre::Result<Option<(U256, u64)>> {
+        let record = self.store.get(target, record_key(address.into_array()), None, None).map_err(|e| eyre::eyre!("{e:?}"))?.into_value();
+        let Some(record) = record else { return Ok(None) };
+        // As `GolemAccounts::account`: an account is a record with a balance or a nonce, either absent reading zero.
+        let balance = record.cell(CELL_BALANCE).map(|c| <[u8; 32]>::try_from(c.value.as_slice())).transpose();
+        let nonce = record.cell(CELL_NONCE).map(|c| <[u8; 8]>::try_from(c.value.as_slice())).transpose();
+        let (Ok(balance), Ok(nonce)) = (balance, nonce) else { eyre::bail!("malformed account record") };
+        if balance.is_none() && nonce.is_none() {
+            return Ok(None);
+        }
+        Ok(Some((balance.map_or(U256::ZERO, U256::from_be_bytes), nonce.map_or(0, u64::from_be_bytes))))
     }
 
     /// The store's head commit.
     pub(crate) fn store_head(&self) -> CommitId {
         self.store.head()
-    }
-
-    /// Drop the sealed candidates at `height` and below that will never be adopted.
-    fn discard_pending(&self, height: u64) {
-        // `adopt` against a root no candidate has drops every candidate at or below `height` and commits nothing.
-        let _ = self.seals.adopt(&self.store, height, [0xff; 32], [0xff; 32], &[]);
     }
 
     /// An account at the head, as `eth_getBalance` / `eth_getTransactionCount` answer it.
@@ -538,9 +604,9 @@ pub unsafe extern "C" fn arkiv_head(handle: u64, out_ptr: *mut *mut u8, out_len:
     })
 }
 
-/// Execute an RLP block whose transactions were sent by `senders` (20 bytes each), and commit it when `commit` is
-/// non-zero and its state root matches. The output is [`wire::BlockResult`]'s encoding, or for
-/// [`Status::StateRootMismatch`] the root reached.
+/// Execute an RLP block whose transactions were sent by `senders` (20 bytes each) and, when its state root matches,
+/// apply it as `apply` says: 0 a dry run, 1 commit, 2 hold for [`arkiv_adopt`] ([`Apply`]). The output is
+/// [`wire::BlockResult`]'s encoding, or for [`Status::StateRootMismatch`] the root reached.
 ///
 /// # Safety
 /// Pointers valid for their lengths.
@@ -551,7 +617,7 @@ pub unsafe extern "C" fn arkiv_execute_block(
     block_len: usize,
     senders: *const u8,
     senders_len: usize,
-    commit: i32,
+    apply: i32,
     out_ptr: *mut *mut u8,
     out_len: *mut usize,
 ) -> i32 {
@@ -564,7 +630,29 @@ pub unsafe extern "C" fn arkiv_execute_block(
             return Err((Status::BadInput, "senders are 20 bytes each".into()));
         }
         let senders = senders.chunks_exact(20).map(Address::from_slice).collect();
-        node.execute_block(block, senders, commit != 0).map(|result| result.encode())
+        let apply = match apply {
+            0 => Apply::DryRun,
+            1 => Apply::Commit,
+            2 => Apply::Hold,
+            other => return Err((Status::BadInput, format!("apply {other}: 0, 1 or 2"))),
+        };
+        node.execute_block(block, senders, apply).map(|result| result.encode())
+    })
+}
+
+/// Commit block `hash` (32 bytes), held by [`arkiv_execute_block`]: it becomes the store's head, and every other block
+/// held at its height or below is dropped. [`Status::NotOnHead`] when it is not held over the store's head; the host
+/// then executes it again. The output is empty.
+///
+/// # Safety
+/// `hash` must be 32 readable bytes, or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn arkiv_adopt(handle: u64, hash: *const u8, out_ptr: *mut *mut u8, out_len: *mut usize) -> i32 {
+    let hash = (!hash.is_null()).then(|| B256::from_slice(unsafe { slice(hash, 32) }));
+    guarded(out_ptr, out_len, || {
+        let node = lookup(&NODES, handle)?;
+        let hash = hash.ok_or_else(|| (Status::BadInput, "null hash".into()))?;
+        node.adopt(hash).map(|()| Vec::new())
     })
 }
 

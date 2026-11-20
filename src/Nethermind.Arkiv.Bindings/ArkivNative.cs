@@ -21,6 +21,8 @@ public enum ArkivStatus
     NotOnHead = 3,
     BadInput = 4,
     Internal = 5,
+    /// <summary>The block committed, but reading its result back failed: the head has moved to it, so it must not be treated as unapplied.</summary>
+    Committed = 6,
 }
 
 /// <summary>A native call that did not succeed, with the native side's message.</summary>
@@ -36,8 +38,17 @@ public sealed class ArkivNativeException(ArkivStatus status, string message) : E
 /// nothing native outlives a call; a failed call throws <see cref="ArkivNativeException"/>.
 /// </summary>
 /// <remarks>
-/// Integers in the byte layouts below are little-endian unless stated otherwise. A handle is valid until
-/// <see cref="Close"/>; calls on one handle must not run concurrently with a commit on it (the caller serialises them).
+/// Integers in the byte layouts below are little-endian unless stated otherwise.
+/// <para>
+/// A handle is a number the library checks, not a pointer: an unknown, closed or twice-closed handle fails the call
+/// with <see cref="ArkivStatus.BadInput"/>, and a call in progress keeps its chain alive through a concurrent
+/// <see cref="Close"/>.
+/// </para>
+/// <para>
+/// A commit (<see cref="ExecuteBlock"/> with <c>commit</c> set) must not run concurrently with any other call on the
+/// same chain: it moves the head that reads and executions run against. Everything else may run concurrently, dry
+/// runs and builds of the same block included.
+/// </para>
 /// </remarks>
 public static unsafe partial class ArkivNative
 {
@@ -51,14 +62,17 @@ public static unsafe partial class ArkivNative
 
     /// <summary>Loads the native library from <paramref name="path"/> instead of the package's own.</summary>
     /// <remarks>The library loads once per process, so this must come before the first call, and only the first path counts.</remarks>
+    /// <exception cref="FileNotFoundException">There is no file at <paramref name="path"/>: no other library is loaded in its place.</exception>
     public static void UseLibrary(string path)
     {
+        if (!File.Exists(path)) throw new FileNotFoundException("The Arkiv native library to use does not exist.", path);
         _libraryPath ??= path;
         if (Interlocked.Exchange(ref _resolverSet, 1) == 0) NativeLibrary.SetDllImportResolver(typeof(ArkivNative).Assembly, ResolveConfigured);
     }
 
+    // Loads the configured path or fails: falling back to the package's library would run another binary unnoticed.
     private static nint ResolveConfigured(string name, Assembly assembly, DllImportSearchPath? searchPath) =>
-        name == Library && _libraryPath is not null && File.Exists(_libraryPath) ? NativeLibrary.Load(_libraryPath) : nint.Zero;
+        name == Library && _libraryPath is not null ? NativeLibrary.Load(_libraryPath) : nint.Zero;
 
     /// <summary>Finds the package's library under <c>runtimes/&lt;rid&gt;/native</c> beside the assembly, where a build that is not RID-specific puts it.</summary>
     private static nint OnResolvingUnmanagedDll(Assembly context, string name)
@@ -124,7 +138,12 @@ public static unsafe partial class ArkivNative
     /// <summary>Copies the returned buffer out, frees it, and throws for any status but <see cref="ArkivStatus.Ok"/>.</summary>
     private static byte[] Take(int status, byte* ptr, nuint len)
     {
-        byte[] bytes = len == 0 ? [] : new ReadOnlySpan<byte>(ptr, checked((int)len)).ToArray();
+        if (len > int.MaxValue)
+        {
+            arkiv_free(ptr, len);
+            throw new InvalidOperationException($"The Arkiv native library returned {len} bytes, more than a buffer holds.");
+        }
+        byte[] bytes = len == 0 ? [] : new ReadOnlySpan<byte>(ptr, (int)len).ToArray();
         arkiv_free(ptr, len);
         return status == (int)ArkivStatus.Ok ? bytes : throw new ArkivNativeException((ArkivStatus)status, Encoding.UTF8.GetString(bytes));
     }
@@ -167,8 +186,14 @@ public static unsafe partial class ArkivNative
     /// </returns>
     /// <exception cref="ArkivNativeException">
     /// <see cref="ArkivStatus.StateRootMismatch"/> (the message is the root reached), <see cref="ArkivStatus.InvalidBlock"/>,
-    /// <see cref="ArkivStatus.NotOnHead"/> when the block's parent is not the head.
+    /// <see cref="ArkivStatus.NotOnHead"/> when the block's parent is not the head, <see cref="ArkivStatus.Committed"/>
+    /// when the block committed but its result could not be read back.
     /// </exception>
+    /// <remarks>
+    /// A block Arkiv charges nothing for (no transaction) changes no state and commits nothing, as on arkiv-reth; it
+    /// becomes the head the next block builds on, in memory. After the process restarts the head is the last block that
+    /// changed state, so the blocks applied since are applied again (each changes nothing).
+    /// </remarks>
     public static byte[] ExecuteBlock(ulong handle, ReadOnlySpan<byte> blockRlp, ReadOnlySpan<byte> senders, bool commit)
     {
         fixed (byte* b = blockRlp)

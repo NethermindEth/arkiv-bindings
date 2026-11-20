@@ -116,6 +116,24 @@ public class ArkivNativeTests
         }
     }
 
+    [Test]
+    public void A_closed_handle_is_refused_and_closing_twice_is_harmless()
+    {
+        ulong handle = OpenChain(null, out _);
+        ArkivNative.Close(handle);
+        ArkivNative.Close(handle);
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(Assert.Throws<ArkivNativeException>(() => ArkivNative.Head(handle))!.Status, Is.EqualTo(ArkivStatus.BadInput));
+            Assert.That(Assert.Throws<ArkivNativeException>(() => ArkivNative.Head(0))!.Status, Is.EqualTo(ArkivStatus.BadInput));
+            Assert.That(Assert.Throws<ArkivNativeException>(() => ArkivNative.BuildFinish(12345))!.Status, Is.EqualTo(ArkivStatus.BadInput));
+        }
+    }
+
+    [Test]
+    public void Using_a_library_that_does_not_exist_is_refused() =>
+        Assert.That(() => ArkivNative.UseLibrary(Path.Combine(Path.GetTempPath(), "no-such-arkiv-ffi.so")), Throws.TypeOf<FileNotFoundException>());
+
     [TestCase(0)]
     [TestCase(19)]
     [TestCase(21)]

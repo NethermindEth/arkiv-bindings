@@ -1,0 +1,4 @@
+# The toolchain the library builds with, locally and in CI (.github/workflows/build-arkiv-ffi.yml, test-publish.yml):
+# the setup-rust action makes rustup available, which installs this channel on the first cargo invocation.
+[toolchain]
+channel = "1.97"

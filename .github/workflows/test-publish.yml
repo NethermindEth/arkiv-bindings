@@ -1,0 +1,184 @@
+name: Test / Publish
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish to NuGet
+        default: 'No'
+        type: choice
+        options:
+          - 'No'
+          - Staging
+          - Production
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: Test (${{ matrix.rid }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, rid: linux-x64, file: libarkiv_ffi.so }
+          - { os: ubuntu-24.04-arm, rid: linux-arm64, file: libarkiv_ffi.so }
+          - { os: macos-latest, rid: osx-arm64, file: libarkiv_ffi.dylib }
+          - { os: macos-26-intel, rid: osx-x64, file: libarkiv_ffi.dylib }
+          # Windows is experimental until it is known to build: its failure is reported, not blocking.
+          - { os: windows-latest, rid: win-x64, file: arkiv_ffi.dll, experimental: true }
+          - { os: windows-11-arm, rid: win-arm64, file: arkiv_ffi.dll, experimental: true }
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental || false }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          lfs: true
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v6
+
+      # On failure cargo's errors become an annotation, which anyone can read; job logs need admin rights.
+      - name: Native tests
+        working-directory: native/arkiv-ffi
+        run: |
+          set -o pipefail
+          cargo test --release --locked 2>&1 | tee ../cargo-test.log || {
+            echo "::error title=cargo test (${{ matrix.rid }})::$(grep -E -A4 '^error|panicked|FAILED' ../cargo-test.log | head -60 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+            exit 1
+          }
+
+      # The bindings are tested against the library built from this commit's source, not the committed binaries.
+      - name: Build the native library
+        working-directory: native/arkiv-ffi
+        run: |
+          set -o pipefail
+          cargo build --release --locked 2>&1 | tee ../cargo-build.log || {
+            echo "::error title=cargo build (${{ matrix.rid }})::$(grep -E '^error' -A6 ../cargo-build.log | head -40 | sed -e 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+            exit 1
+          }
+          mkdir -p ../../src/Nethermind.Arkiv.Bindings/runtimes/${{ matrix.rid }}/native
+          cp target/release/${{ matrix.file }} ../../src/Nethermind.Arkiv.Bindings/runtimes/${{ matrix.rid }}/native/
+
+      - name: Test
+        working-directory: src/Nethermind.Arkiv.Bindings.Tests
+        run: dotnet test -c release
+
+  # The binaries that ship are the committed ones (built by build-arkiv-ffi), not the test job's: run the tests on them.
+  verify:
+    name: Verify the committed binaries (${{ matrix.rid }})
+    needs: test
+    if: github.event_name == 'workflow_dispatch' && inputs.publish != 'No' && github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, rid: linux-x64, file: libarkiv_ffi.so }
+          - { os: ubuntu-24.04-arm, rid: linux-arm64, file: libarkiv_ffi.so }
+          - { os: macos-latest, rid: osx-arm64, file: libarkiv_ffi.dylib }
+          - { os: macos-26-intel, rid: osx-x64, file: libarkiv_ffi.dylib }
+          - { os: windows-latest, rid: win-x64, file: arkiv_ffi.dll, optional: true }
+          - { os: windows-11-arm, rid: win-arm64, file: arkiv_ffi.dll, optional: true }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          lfs: true
+
+      - name: Find the binary
+        id: binary
+        run: |
+          if [ -s src/Nethermind.Arkiv.Bindings/runtimes/${{ matrix.rid }}/native/${{ matrix.file }} ]; then
+            echo "present=true" >> $GITHUB_OUTPUT
+          elif [ "${{ matrix.optional || false }}" = true ]; then
+            echo "::warning::no ${{ matrix.rid }} binary: the package will not support that platform"
+          else
+            echo "::error::no ${{ matrix.rid }} binary: run the build-arkiv-ffi workflow"; exit 1
+          fi
+
+      - name: Set up .NET
+        if: steps.binary.outputs.present == 'true'
+        uses: actions/setup-dotnet@v6
+
+      - name: Test
+        if: steps.binary.outputs.present == 'true'
+        working-directory: src/Nethermind.Arkiv.Bindings.Tests
+        run: dotnet test -c release
+
+  publish:
+    name: Publish
+    needs: [test, verify]
+    # Only main is published, and Production through an environment that can require approval.
+    if: github.event_name == 'workflow_dispatch' && inputs.publish != 'No' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.publish == 'Production' && 'nuget-production' || 'nuget-staging' }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      NUGET_URL: ${{ inputs.publish == 'Staging' && 'https://int.nugettest.org' || 'https://www.nuget.org' }}
+      NUGET_SOURCE: ${{ inputs.publish == 'Staging' && 'https://apiint.nugettest.org' || 'https://api.nuget.org' }}/v3/index.json
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          lfs: true
+
+      # The committed binaries must have been built (by build-arkiv-ffi) from the source being published.
+      - name: Check the binaries
+        run: |
+          runtimes=src/Nethermind.Arkiv.Bindings/runtimes
+          for f in linux-x64/native/libarkiv_ffi.so linux-arm64/native/libarkiv_ffi.so osx-arm64/native/libarkiv_ffi.dylib osx-x64/native/libarkiv_ffi.dylib; do
+            test -s $runtimes/$f || { echo "::error::$runtimes/$f is missing: run the build-arkiv-ffi workflow"; exit 1; }
+          done
+          # Windows is packed when its build succeeded.
+          for f in win-x64/native/arkiv_ffi.dll win-arm64/native/arkiv_ffi.dll; do
+            test -s $runtimes/$f || echo "::warning::$runtimes/$f is missing: the package will not support that platform"
+          done
+          built=$(cat $runtimes/SOURCE)
+          current=$(git rev-parse HEAD:native/arkiv-ffi)
+          [ "$built" = "$current" ] || { echo "::error::the binaries were built from native/arkiv-ffi $built, the source is now $current: run the build-arkiv-ffi workflow"; exit 1; }
+
+      - name: Detect version
+        id: version
+        working-directory: src
+        run: |
+          version_prefix=$(sed -n 's|.*<VersionPrefix>\(.*\)</VersionPrefix>.*|\1|p' Directory.Build.props)
+          version_suffix=$(sed -n 's|.*<VersionSuffix>\(.*\)</VersionSuffix>.*|\1|p' Directory.Build.props)
+          version=$version_prefix${version_suffix:+-$version_suffix}
+          echo "Detected version $version"
+          echo "version=$version" >> $GITHUB_OUTPUT
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v6
+
+      - name: NuGet login
+        uses: nuget/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
+        id: login
+        with:
+          user: ${{ secrets.NUGET_USER }}
+          audience: ${{ env.NUGET_URL }}
+          token-service-url: ${{ env.NUGET_URL }}/api/v2/token
+
+      - name: Publish
+        working-directory: src
+        run: |
+          dotnet pack ./Nethermind.Arkiv.Bindings -c release \
+            -p:Version=${{ steps.version.outputs.version }}
+          dotnet nuget push ./artifacts/package/release/*.nupkg \
+            -k "${{ steps.login.outputs.NUGET_API_KEY }}" -s ${{ env.NUGET_SOURCE }}

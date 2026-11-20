@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <EnableNUnitRunner>true</EnableNUnitRunner>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>Nethermind.Arkiv.Native.Test</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NUnit" />
+    <PackageReference Include="NUnit.Analyzers">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="NUnit3TestAdapter" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Nethermind.Arkiv.Bindings\Nethermind.Arkiv.Bindings.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The native tests' data: Rabdi's genesis and blocks 1-700 with their senders. -->
+    <None Include="../../native/arkiv-ffi/testdata/*" Link="TestData/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

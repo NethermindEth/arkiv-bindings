@@ -1,0 +1,113 @@
+name: Build libarkiv_ffi
+
+# Builds native/arkiv-ffi for every packaged platform and, on request, opens a pull request committing the binaries
+# under src/Nethermind.Arkiv.Bindings/runtimes (Git LFS) together with the tree hash of the source they were built
+# from, which the publish job checks. Windows is experimental: a failed Windows build does not stop the others, and
+# its binaries are committed only when it builds.
+
+on:
+  workflow_dispatch:
+    inputs:
+      create-pr:
+        description: Create a pull request
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RETENTION: 7
+  # Release binaries without debug info (Cargo.toml keeps it for local profiling).
+  CARGO_PROFILE_RELEASE_DEBUG: 0
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+
+jobs:
+  build:
+    name: Build ${{ matrix.rid }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu 22.04 keeps the glibc requirement at 2.35.
+          - { rid: linux-x64, os: ubuntu-22.04, file: libarkiv_ffi.so }
+          - { rid: linux-arm64, os: ubuntu-22.04-arm, file: libarkiv_ffi.so }
+          - { rid: osx-arm64, os: macos-latest, file: libarkiv_ffi.dylib }
+          - { rid: osx-x64, os: macos-26-intel, file: libarkiv_ffi.dylib }
+          - { rid: win-x64, os: windows-2022, file: arkiv_ffi.dll, experimental: true }
+          - { rid: win-arm64, os: windows-11-arm, file: arkiv_ffi.dll, experimental: true }
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental || false }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Build
+        working-directory: native/arkiv-ffi
+        run: cargo build --release --locked
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.rid }}
+          path: native/arkiv-ffi/target/release/${{ matrix.file }}
+          retention-days: ${{ env.RETENTION }}
+          if-no-files-found: error
+
+  create-pr:
+    name: Create a pull request
+    needs: build
+    if: github.event.inputs.create-pr == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          lfs: true
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Move artifacts
+        run: |
+          runtimes=src/Nethermind.Arkiv.Bindings/runtimes
+          # A platform that failed this time must not keep a binary from an older source.
+          rm -rf $runtimes/*/native
+          for dir in artifacts/*/; do
+            rid=$(basename "$dir")
+            mkdir -p $runtimes/$rid/native
+            mv -f "$dir"* $runtimes/$rid/native/
+          done
+          ls artifacts | paste -sd ' ' > built-rids
+          git rev-parse HEAD:native/arkiv-ffi > $runtimes/SOURCE
+          rm -rf artifacts
+
+      - name: Create a pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          source=$(git rev-parse --short HEAD)
+          rids=$(cat built-rids) && rm built-rids
+          head_branch=feature/libarkiv-ffi-build-$GITHUB_RUN_NUMBER-$GITHUB_RUN_ATTEMPT
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b $head_branch
+          git add -A
+          git commit -m "Update libarkiv_ffi binaries"
+          git push origin $head_branch
+          gh pr create -B $GITHUB_REF_NAME -H $head_branch -t "chore: update libarkiv_ffi binaries to $source" \
+            -b "Built native/arkiv-ffi at $source for: $rids."

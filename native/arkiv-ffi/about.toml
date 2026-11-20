@@ -1,0 +1,23 @@
+# cargo-about: the licences the native library's dependencies may carry, for THIRD-PARTY-NOTICES
+# (cargo about generate about.hbs > ../../THIRD-PARTY-NOTICES).
+accepted = [
+    "MIT",
+    "MIT-0",
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+    "Unlicense",
+    "BSL-1.0",
+    "OpenSSL",
+]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true

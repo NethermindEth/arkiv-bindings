@@ -197,3 +197,61 @@ fn concurrent_builds_of_one_block_both_finish() {
         });
     }
 }
+
+/// A block with no transaction leaves no sealed state (Arkiv charges nothing for it). It is accepted with the
+/// state unchanged, as arkiv-reth accepts it, and committed under its own hash, so the next block, empty or not,
+/// finds its parent at the head.
+#[test]
+fn empty_blocks_are_accepted_and_the_chain_continues() {
+    let node = Node::open(RABDI_GENESIS, None).unwrap();
+    let blocks = rabdi_blocks();
+    for (block, senders) in blocks.iter().take(10) {
+        node.execute_block(block.clone(), senders.clone(), true).unwrap();
+    }
+    let (_, _, root) = node.head().unwrap();
+    let empty_after = |parent: &alloy_consensus::Header| {
+        let mut header = parent.clone();
+        header.parent_hash = parent.hash_slow();
+        header.number = parent.number + 1;
+        header.timestamp = parent.timestamp + 2;
+        header.gas_used = 0;
+        header.state_root = root;
+        Block { header, body: reth_ethereum::BlockBody { transactions: vec![], ommers: vec![], withdrawals: Some(Default::default()) } }
+    };
+
+    let first = empty_after(&blocks[9].0.header);
+    assert_eq!(node.execute_block(first.clone(), vec![], false).unwrap().state_root, root, "a dry run");
+    assert_eq!(node.execute_block(first.clone(), vec![], true).unwrap().state_root, root);
+    assert_eq!(node.head().unwrap().1, first.header.hash_slow());
+    let second = empty_after(&first.header);
+    node.execute_block(second.clone(), vec![], true).unwrap();
+    let (_, tag, head_root) = node.head().unwrap();
+    assert_eq!((tag, head_root), (second.header.hash_slow(), root), "the head names the latest block, its state unchanged");
+
+    let session = node.build_begin(empty_after(&second.header).header).unwrap();
+    assert_eq!(session.finish().unwrap().state_root, root, "a build with nothing applied keeps the parent's root");
+}
+
+/// Executions that do not commit (as block validation without import does) run side by side without dropping each
+/// other's seal.
+#[test]
+fn concurrent_dry_runs_of_one_block_all_finish() {
+    let node = Node::open(RABDI_GENESIS, None).unwrap();
+    let blocks = rabdi_blocks();
+    let (target, senders) = blocks.iter().find(|(block, _)| block.body.transactions.len() > 1).unwrap().clone();
+    for (block, block_senders) in blocks.iter().take_while(|(block, _)| block.header.number < target.header.number) {
+        node.execute_block(block.clone(), block_senders.clone(), true).unwrap();
+    }
+    for _ in 0..20 {
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let (node, barrier, target, senders) = (&node, &barrier, &target, &senders);
+                scope.spawn(move || {
+                    barrier.wait();
+                    assert_eq!(node.execute_block(target.clone(), senders.clone(), false).unwrap().state_root, target.header.state_root);
+                });
+            }
+        });
+    }
+}

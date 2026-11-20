@@ -1396,7 +1396,6 @@ version = "1.0.0"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
- "alloy-evm",
  "alloy-network",
  "alloy-primitives",
  "alloy-rlp",
@@ -1414,7 +1413,6 @@ dependencies = [
  "arkiv-reth-rpc",
  "arkiv-reth-statemanager",
  "arkiv-rpc-types",
- "arkiv-tokenomics",
  "eyre",
  "flate2",
  "golemdb-cells",
@@ -1422,7 +1420,6 @@ dependencies = [
  "golemdb-storage",
  "golemdb-storage-mdbx",
  "jsonrpsee-types",
- "reth-chainspec",
  "reth-cli",
  "reth-ethereum",
  "reth-evm",
